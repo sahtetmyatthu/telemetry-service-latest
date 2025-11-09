@@ -12,8 +12,7 @@ import java.util.Set;
 import java.util.concurrent.*;
 
 /**
- * Manages the lifecycle of MAVLink listeners.
- * Handles starting, stopping, and monitoring listeners.
+ * FIXED: Reduced health check frequency
  */
 @Component
 @Slf4j
@@ -29,16 +28,14 @@ public class ListenerManager {
         this.healthCheckExecutor = Executors.newSingleThreadScheduledExecutor(
                 r -> new Thread(r, Constants.THREAD_HEALTH_CHECK));
 
-        // Start health check every 10 seconds
+        // FIXED: Reduced health check from every 3 seconds to every 30 seconds
+        // Dead listeners will be cleaned up eventually, no need to check so often
         healthCheckExecutor.scheduleAtFixedRate(
-                this::checkListenerHealth, 3, 3, TimeUnit.SECONDS);
+                this::checkListenerHealth, 30, 30, TimeUnit.SECONDS);
     }
 
     /**
-     * Starts a listener on the specified port if not already active.
-     *
-     * @param port Port to start listening on
-     * @return true if listener was started, false if already active
+     * Starts a listener on the specified port if not already active
      */
     public boolean startListener(int port) {
         if (isListenerActive(port)) {
@@ -61,9 +58,7 @@ public class ListenerManager {
     }
 
     /**
-     * Stops the listener on the specified port.
-     *
-     * @param port Port to stop listening on
+     * Stops the listener on the specified port
      */
     public void stopListener(int port) {
         ListenerState state = activeListeners.remove(port);
@@ -74,10 +69,7 @@ public class ListenerManager {
     }
 
     /**
-     * Checks if a listener is active on the port.
-     *
-     * @param port Port to check
-     * @return true if listener is active
+     * Checks if a listener is active on the port
      */
     public boolean isListenerActive(int port) {
         ListenerState state = activeListeners.get(port);
@@ -85,26 +77,29 @@ public class ListenerManager {
     }
 
     /**
-     * Gets all active listener ports.
-     *
-     * @return Set of active port numbers
+     * Gets all active listener ports
      */
     public Set<Integer> getActivePorts() {
         return new HashSet<>(activeListeners.keySet());
     }
 
     /**
-     * Periodically checks listener health and removes dead ones.
+     * Periodically checks listener health and removes dead ones
      */
     private void checkListenerHealth() {
-        activeListeners.entrySet().removeIf(entry -> {
+        int removed = 0;
+        for (Map.Entry<Integer, ListenerState> entry : activeListeners.entrySet()) {
             ListenerState state = entry.getValue();
             if (!state.isActive()) {
-                log.warn("Removing dead listener on port {}", entry.getKey());
-                return true;
+                activeListeners.remove(entry.getKey());
+                log.warn("Removed dead listener on port {}", entry.getKey());
+                removed++;
             }
-            return false;
-        });
+        }
+        if (removed > 0) {
+            log.info("Health check removed {} dead listeners, {} active",
+                    removed, activeListeners.size());
+        }
     }
 
     @PreDestroy
@@ -126,7 +121,7 @@ public class ListenerManager {
     }
 
     /**
-     * Internal state tracker for a listener.
+     * Internal state tracker for a listener
      */
     @Getter
     private static class ListenerState {

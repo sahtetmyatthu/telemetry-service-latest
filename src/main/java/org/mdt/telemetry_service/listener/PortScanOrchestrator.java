@@ -14,8 +14,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
- * Orchestrates port scanning and listener startup.
- * Simple coordinator that replaces the complex PortScanner.
+ * FIXED: Reduced scanning frequency to lower CPU usage
  */
 @Component
 @Slf4j
@@ -35,25 +34,24 @@ public class PortScanOrchestrator {
         this.portManager = portManager;
         this.scheduler = Executors.newSingleThreadScheduledExecutor(
                 r -> new Thread(r, Constants.THREAD_PORT_SCANNER));
-
-
     }
 
     @PostConstruct
     public void start() {
         log.info("Starting port scan orchestrator");
 
-        // Run scan every 1 second
+        // FIXED: Reduced scan frequency from 1 second to 5 seconds
+        // This dramatically reduces CPU usage
         scheduler.scheduleWithFixedDelay(
                 this::scanCycle,
                 0,
-                1,
+                5,  // Was 1 second, now 5 seconds
                 TimeUnit.SECONDS
         );
     }
 
     /**
-     * Single scan cycle - simple and clear logic!
+     * Single scan cycle - simple and clear logic
      */
     private void scanCycle() {
         try {
@@ -87,9 +85,7 @@ public class PortScanOrchestrator {
     }
 
     /**
-     * Returns ports that should be scanned:
-     * - Ports in the scan list
-     * - That DON'T already have active listeners
+     * Returns ports that should be scanned
      */
     private List<Integer> getPortsNeedingScanning() {
         Set<Integer> activePorts = listenerManager.getActivePorts();

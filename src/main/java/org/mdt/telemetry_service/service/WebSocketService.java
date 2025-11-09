@@ -18,19 +18,23 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
- * Handles WebSocket connections and broadcasts telemetry data.
+ * FIXED: Optimized WebSocket with caching to reduce JSON serialization
  */
 @Component
 @Slf4j
-@RequiredArgsConstructor  // Lombok will create constructor with final fields
+@RequiredArgsConstructor
 public class WebSocketService extends TextWebSocketHandler {
 
     private final CopyOnWriteArrayList<WebSocketSession> sessions = new CopyOnWriteArrayList<>();
     private final Map<String, String> sessionPortMap = new ConcurrentHashMap<>();
     private final Map<String, Object> sessionLocks = new ConcurrentHashMap<>();
-
-    // Inject Spring's pre-configured ObjectMapper
     private final ObjectMapper objectMapper;
+
+    // FIXED: Cache serialized JSON to avoid repeated serialization
+    private volatile String cachedAllDronesJson = null;
+    private volatile long lastCacheTime = 0;
+    private static final long CACHE_TTL_MS = 100; // Cache for 100ms
+    private final Map<String, String> portSpecificCache = new ConcurrentHashMap<>();
 
     @Override
     public void afterConnectionEstablished(@NonNull WebSocketSession session) {
@@ -50,6 +54,9 @@ public class WebSocketService extends TextWebSocketHandler {
         log.info("WebSocket disconnected: {}", session.getId());
     }
 
+    /**
+     * FIXED: Broadcast with JSON caching to reduce CPU usage
+     */
     public void broadcast(Map<String, Object> data) {
         if (data == null || !data.containsKey("drones")) {
             log.warn("Invalid data: null or missing 'drones' key");
@@ -57,26 +64,39 @@ public class WebSocketService extends TextWebSocketHandler {
         }
 
         List<?> dronesList = (List<?>) data.get("drones");
+        if (dronesList.isEmpty()) {
+            return; // No data to send
+        }
+
+        long now = System.currentTimeMillis();
+
+        // FIXED: Check if we can use cached JSON
+        boolean cacheValid = (now - lastCacheTime) < CACHE_TTL_MS;
+
+        if (!cacheValid) {
+            // Invalidate all caches
+            cachedAllDronesJson = null;
+            portSpecificCache.clear();
+            lastCacheTime = now;
+        }
 
         for (WebSocketSession session : sessions) {
             if (!session.isOpen()) {
                 continue;
             }
 
-            Object lock = sessionLocks.computeIfAbsent(session.getId(), k -> new Object());
+            try {
+                String sessionId = session.getId();
+                String port = sessionPortMap.get(sessionId);
+                String jsonData;
 
-            synchronized (lock) {
-                try {
-                    String sessionId = session.getId();
-                    String port = sessionPortMap.get(sessionId);
-
-                    String jsonData;
-
-                    if (port != null) {
+                if (port != null) {
+                    // Port-specific session
+                    jsonData = portSpecificCache.computeIfAbsent(port, p -> {
                         Object portData = dronesList.stream()
                                 .filter(drone -> {
                                     if (drone instanceof Map<?, ?> droneMap) {
-                                        return String.valueOf(droneMap.get("port")).equals(port);
+                                        return String.valueOf(droneMap.get("port")).equals(p);
                                     }
                                     return false;
                                 })
@@ -84,23 +104,38 @@ public class WebSocketService extends TextWebSocketHandler {
                                 .orElse(null);
 
                         if (portData != null) {
-                            jsonData = objectMapper.writeValueAsString(
-                                    Map.of("drones", List.of(portData)));
-                            log.trace("Sent port-specific telemetry for port {} to session {}",
-                                    port, sessionId);
-                        } else {
-                            continue;
+                            try {
+                                return objectMapper.writeValueAsString(
+                                        Map.of("drones", List.of(portData)));
+                            } catch (IOException e) {
+                                log.error("Error serializing port data", e);
+                                return null;
+                            }
                         }
-                    } else {
-                        jsonData = objectMapper.writeValueAsString(data);
-                        log.trace("Sent all telemetry data to session {}", sessionId);
+                        return null;
+                    });
+
+                    if (jsonData == null) {
+                        continue; // No data for this port
                     }
-
-                    session.sendMessage(new TextMessage(jsonData));
-
-                } catch (IOException e) {
-                    log.error("Error sending message to session {}", session.getId(), e);
+                } else {
+                    // All drones session - use cached JSON
+                    if (cachedAllDronesJson == null) {
+                        cachedAllDronesJson = objectMapper.writeValueAsString(data);
+                    }
+                    jsonData = cachedAllDronesJson;
                 }
+
+                // Send with per-session locking
+                Object lock = sessionLocks.computeIfAbsent(sessionId, k -> new Object());
+                synchronized (lock) {
+                    if (session.isOpen()) {
+                        session.sendMessage(new TextMessage(jsonData));
+                    }
+                }
+
+            } catch (IOException e) {
+                log.debug("Error sending message to session {}: {}", session.getId(), e.getMessage());
             }
         }
     }

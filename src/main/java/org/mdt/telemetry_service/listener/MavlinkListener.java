@@ -13,15 +13,10 @@ import java.io.IOException;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-
+import java.util.concurrent.*;
 
 /**
- * Simplified MAVLink listener - only responsible for listening,
- * not for managing its own lifecycle.
+ * Fixed MAVLink listener with bounded thread pool
  */
 @Component
 @Slf4j
@@ -36,27 +31,52 @@ public class MavlinkListener {
             MavlinkMessageProcessor messageProcessor) {
         this.properties = properties;
         this.messageProcessor = messageProcessor;
-        this.executorService = Executors.newCachedThreadPool(
-                r -> new Thread(r, Constants.THREAD_LISTENER));
+
+        // FIXED: Use bounded thread pool instead of CachedThreadPool
+        int maxThreads = properties.getMaxPorts(); // Use max-ports as thread limit
+        this.executorService = new ThreadPoolExecutor(
+                50,                          // core pool size
+                maxThreads,                  // maximum pool size
+                60L, TimeUnit.SECONDS,       // keep alive time
+                new LinkedBlockingQueue<>(100), // bounded queue
+                new ThreadFactory() {
+                    private int counter = 0;
+                    @Override
+                    public Thread newThread(Runnable r) {
+                        Thread t = new Thread(r, Constants.THREAD_LISTENER + "-" + counter++);
+                        t.setDaemon(true); // Make threads daemon to prevent JVM hanging
+                        return t;
+                    }
+                },
+                new ThreadPoolExecutor.CallerRunsPolicy() // Back-pressure: run in caller thread if pool full
+        );
+
+        log.info("Initialized MavlinkListener with max {} threads", maxThreads);
     }
 
     /**
      * Starts listening on a port. Returns a Future for lifecycle management.
-     *
-     * @param port Port to listen on
-     * @return Future representing the listening task
      */
     public Future<?> listenOnPort(int port) {
-        return executorService.submit(() -> listen(port));
+        try {
+            return executorService.submit(() -> listen(port));
+        } catch (RejectedExecutionException e) {
+            log.error("Thread pool full, cannot start listener on port {}", port);
+            throw new RuntimeException("Thread pool exhausted", e);
+        }
     }
 
     private void listen(int port) {
         log.info("Starting MAVLink listener on port {}", port);
 
-        try (DatagramSocket socket = createSocket(port);
-             UdpInputStream inputStream = new UdpInputStream(socket)) {
+        DatagramSocket socket = null;
+        UdpInputStream inputStream = null;
+        MavlinkConnection connection = null;
 
-            MavlinkConnection connection = MavlinkConnection.create(inputStream, null);
+        try {
+            socket = createSocket(port);
+            inputStream = new UdpInputStream(socket);
+            connection = MavlinkConnection.create(inputStream, null);
 
             long lastMessageTime = System.currentTimeMillis();
 
@@ -77,19 +97,26 @@ public class MavlinkListener {
                     }
 
                 } catch (IOException e) {
+                    if (Thread.currentThread().isInterrupted()) {
+                        break;
+                    }
                     if (isIdle(lastMessageTime)) {
                         log.info("Port {} timeout with no data", port);
                         break;
                     }
-                    // Otherwise continue
+                    // Brief pause on error to prevent CPU spinning
+                    Thread.sleep(10);
                 }
             }
 
-        } catch (IOException e) {
+        } catch (Exception e) {
             if (!Thread.currentThread().isInterrupted()) {
                 log.error("Error in listener on port {}", port, e);
             }
         } finally {
+            // FIXED: Proper resource cleanup
+            closeQuietly(inputStream);
+            closeQuietly(socket);
             log.info("MAVLink listener stopped on port {}", port);
         }
     }
@@ -97,13 +124,33 @@ public class MavlinkListener {
     private DatagramSocket createSocket(int port) throws IOException {
         DatagramSocket socket = new DatagramSocket(null);
         socket.setReuseAddress(true);
+        socket.setSoTimeout(1000); // FIXED: Add socket timeout to prevent blocking forever
         socket.bind(new InetSocketAddress("0.0.0.0", port));
         return socket;
     }
 
     private boolean isIdle(long lastMessageTime) {
-        return (System.currentTimeMillis() - lastMessageTime)
-                > properties.getIdleThresholdMs();
+        return (System.currentTimeMillis() - lastMessageTime) > properties.getIdleThresholdMs();
+    }
+
+    private void closeQuietly(AutoCloseable closeable) {
+        if (closeable != null) {
+            try {
+                closeable.close();
+            } catch (Exception e) {
+                log.debug("Error closing resource", e);
+            }
+        }
+    }
+
+    private void closeQuietly(DatagramSocket socket) {
+        if (socket != null && !socket.isClosed()) {
+            try {
+                socket.close();
+            } catch (Exception e) {
+                log.debug("Error closing socket", e);
+            }
+        }
     }
 
     @PreDestroy
@@ -113,7 +160,12 @@ public class MavlinkListener {
 
         try {
             if (!executorService.awaitTermination(10, TimeUnit.SECONDS)) {
+                log.warn("Forcing shutdown of listener threads");
                 executorService.shutdownNow();
+
+                if (!executorService.awaitTermination(5, TimeUnit.SECONDS)) {
+                    log.error("Listener thread pool did not terminate");
+                }
             }
         } catch (InterruptedException e) {
             executorService.shutdownNow();
